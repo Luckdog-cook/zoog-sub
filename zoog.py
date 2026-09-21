@@ -11,6 +11,10 @@ PASSWORD = os.environ.get("ZOOG_PASSWORD", "6EB6298BFE14724D869A07A5F94642D8")
 BASE_URL = os.environ.get("ZOOG_BASE", "https://78.46.85.211/RESTF-1.0.3/rest/api/")
 OUT_DIR  = Path("./output")
 
+# 代理：ZoogVPN API 走代理，CF IP 直连
+ZOOG_PROXY = os.environ.get("ZOOG_PROXY", "").strip()
+PROXIES = {"http": ZOOG_PROXY, "https": ZOOG_PROXY} if ZOOG_PROXY else None
+
 AES_KEY = "cJfUueyJiTDK1cEqETnxPuHs3YUrehAd"
 AES_IV  = "CufmfUjCLT8MiY0z"
 
@@ -26,7 +30,6 @@ CF_SOURCES = {
 TOP_N = 30
 MOVE_MIN_KEEP = 5
 
-# 全局 session 复用连接
 _sess = requests.Session()
 _sess.verify = False
 
@@ -55,7 +58,8 @@ def make_headers(region=None):
 def get_servers():
     r = _sess.get(BASE_URL + "servers_v2",
                   params={"email": EMAIL, "password": PASSWORD},
-                  headers=make_headers("Auto"), timeout=12)
+                  headers=make_headers("Auto"), timeout=15,
+                  proxies=PROXIES)
     r.raise_for_status()
     data = r.json()
     if data.get("error"):
@@ -68,18 +72,16 @@ def get_servers():
 
 
 def get_config(name):
-    """抓单个节点配置，带上完整请求头 + 重试 + 节流"""
     url = BASE_URL + "server_config"
     params = {"email": EMAIL, "password": PASSWORD, "config_name": name}
-
     for attempt in range(3):
         try:
-            r = _sess.get(url, params=params, headers=make_headers(), timeout=12)
+            r = _sess.get(url, params=params, headers=make_headers(),
+                          timeout=15, proxies=PROXIES)
             if r.status_code == 200:
                 d = r.json()
                 if "outbounds" in d:
                     return parse_xray(d)
-                # 有时会返回空对象或者非 Xray 配置
                 return None
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(1 + attempt)
@@ -130,7 +132,7 @@ def parse_xray(d):
 def _fetch_ip_list(url, region_key, seen):
     out = []
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=10)  # 直连，不走代理
         for line in r.text.splitlines():
             ip = line.strip().split(":")[0].split("#")[0].strip()
             if not ip or not ip.startswith("104."):
@@ -183,10 +185,14 @@ def write_sub(links, path):
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    if PROXIES:
+        print(f"[诊断] 代理已启用: {ZOOG_PROXY.split('@')[-1]}")
+    else:
+        print("[诊断] 未启用代理,直连 (有可能被 ZoogVPN 风控)")
+
     print("[1/3] 抓取 ZoogVPN 全部节点...")
     servers = get_servers()
 
-    # 收集所有需要抓的 config_name
     jobs = []
     for srv in servers:
         for proto in srv.get("protocols", []):
@@ -207,8 +213,7 @@ def main():
             return cfg
         return None
 
-    # 并发降到 2，避免被 API 限流
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(worker, j) for j in jobs]
         done = 0
         for f in as_completed(futures):
@@ -221,7 +226,7 @@ def main():
                 pass
             if done % 20 == 0 or done == len(jobs):
                 print(f"  进度 {done}/{len(jobs)} 成功 {len(all_nodes)}")
-            time.sleep(0.05)  # 节流
+            time.sleep(0.05)
 
     print(f"[诊断] 成功解析节点: {len(all_nodes)}")
     if not all_nodes:
