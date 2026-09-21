@@ -24,8 +24,4 @@ jobs:
           git add output/
           git diff --staged --quiet || git commit -m "update"
           git push
-      - uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: pages deploy output/ --project-name=zoog-sub
+      
