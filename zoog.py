@@ -45,9 +45,16 @@ AES_IV = "CufmfUjCLT8MiY0z"
 PROTOCOLS = ("SS_XR_SYSPR", "SS_XR_PR")
 TOP_N = 30
 
-# Cloudflare 优选 IP 源(旧路径 BestCF/mobile.txt 等已 404,现用改版后的文件)
+# Cloudflare 优选 IP 源
+#  主源 vipmc838/cf_best_ip: 带运营商维度(默认/电信/联通/移动),按实测带宽排序
+#  备源 ymyuuu/IPDB BestCF:   无运营商维度,仅作兜底
+#  注: 旧脚本用的 BestCF/mobile.txt 等路径已 404,git 历史中也不存在该文件
+CF_JSON = "https://raw.githubusercontent.com/vipmc838/cf_best_ip/main/cloudflare_bestip.json"
 BESTCF_V4 = "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/bestcfv4.txt"
 CF_TOP_K = 5
+
+# 运营商 -> 输出文件名前缀
+ISP_FILES = {"默认": "zoog", "电信": "t-zoog", "联通": "u-zoog", "移动": "m-zoog"}
 
 _sess = requests.Session()
 _sess.verify = False
@@ -218,20 +225,40 @@ def write_sub(links, path):
         base64.b64encode("\n".join(links).encode()).decode(), encoding="utf-8")
 
 
-def fetch_cf_ips():
-    """拉取 Cloudflare 优选 IP(直连,不走代理)"""
+def _valid_v4(ip: str) -> bool:
+    return bool(ip) and ":" not in ip and ip[0].isdigit()
+
+
+def fetch_isp_ips():
+    """按运营商拉取 Cloudflare 优选 IP,返回 {运营商: [ip, ...]}"""
+    try:
+        r = requests.get(CF_JSON, timeout=20)
+        best = r.json().get("最优IP", {})
+        out = {}
+        for isp in ISP_FILES:
+            ips = [x.strip() for x in best.get(isp, []) if _valid_v4(x.strip())]
+            if ips:
+                out[isp] = ips
+        if out:
+            print(f"      主源: {', '.join(f'{k}{len(v)}' for k, v in out.items())}")
+            return out
+    except Exception as e:
+        print(f"[警告] 优选 IP 主源失败: {e}")
+
+    # 兜底:无运营商维度的单一列表
     try:
         r = requests.get(BESTCF_V4, timeout=20)
         ips = []
         for line in r.text.splitlines():
             ip = line.strip().split(":")[0].split("#")[0].strip()
-            if ip and (ip.startswith("104.") or ip.startswith("172.") or ip.startswith("162.")):
-                if ip not in ips:
-                    ips.append(ip)
-        return ips
+            if _valid_v4(ip) and ip not in ips:
+                ips.append(ip)
+        if ips:
+            print(f"      备源: {len(ips)} 个(无运营商区分)")
+            return {"默认": ips}
     except Exception as e:
-        print(f"[警告] 优选 IP 拉取失败: {e}")
-        return []
+        print(f"[警告] 优选 IP 备源失败: {e}")
+    return {}
 
 
 def main():
@@ -319,16 +346,33 @@ def main():
 
     # 直连版本(兜底,不套优选)
     direct_links = [to_uri(n, n.get("server_name", "Zoog")) for n in alive]
+    write_sub(direct_links, OUT_DIR / "zoog-direct.txt")
+    print(f"      直连兜底: {len(direct_links)} 条")
 
-    # ---- 套用 Cloudflare 优选 IP(换地址、保留原 SNI) ----
-    links = direct_links
-    cf_ips = fetch_cf_ips()
-    if cf_ips:
-        print(f"[4/4] 优选 IP: 拿到 {len(cf_ips)} 个,开始测速...")
-        ports = sorted({n["port"] for n in alive})
+    isp_ips = fetch_isp_ips()
+    if not isp_ips:
+        print("[4/4] 未拿到任何优选 IP,全部回退直连地址")
+        for prefix in ISP_FILES.values():
+            write_sub(direct_links, OUT_DIR / f"{prefix}.txt")
+            write_sub(direct_links[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
+        (OUT_DIR / "vless_links.txt").write_text("\n".join(direct_links), encoding="utf-8")
+        print("完成!")
+        return
+
+    print("[4/4] 按运营商套用优选 IP(换地址 + 保留原 SNI)...")
+    ports = sorted({n["port"] for n in alive})
+    default_links = direct_links
+
+    for isp, prefix in ISP_FILES.items():
+        ips = isp_ips.get(isp) or isp_ips.get("默认") or []
+        if not ips:
+            print(f"      [{isp}] 无可用 IP,跳过")
+            continue
+
+        # 只测该运营商的候选 IP
         lat_map = {}
         with ThreadPoolExecutor(max_workers=16) as ex:
-            futs = {ex.submit(tcp_probe, ip, p): (ip, p) for ip in cf_ips for p in ports}
+            futs = {ex.submit(tcp_probe, ip, p): (ip, p) for ip in ips for p in ports}
             for f in as_completed(futs):
                 lat_map[futs[f]] = f.result()
 
@@ -337,10 +381,12 @@ def main():
             ranked = sorted([(l, ip) for (ip, pp), l in lat_map.items()
                              if pp == p and l is not None])
             best_by_port[p] = [ip for l, ip in ranked[:CF_TOP_K]]
-            if ranked:
-                print(f"      端口 {p}: 最快 {ranked[0][1]} ({ranked[0][0]}ms), 取前 {len(best_by_port[p])} 个")
 
-        if any(best_by_port.values()):
+        if not any(best_by_port.values()):
+            print(f"      [{isp}] 优选 IP 全部不可达,回退直连")
+            links = direct_links
+            fast = None
+        else:
             pooled = []
             for idx, n in enumerate(alive):
                 pool_ips = best_by_port.get(n["port"])
@@ -353,22 +399,17 @@ def main():
                 c["address"] = ip
                 c["latency"] = lat_map.get((ip, n["port"]))
                 pooled.append(c)
-            if pooled:
-                links = [to_uri(c, c.get("server_name", "Zoog")) for c in pooled]
-                print(f"      优选套用完成: {len(links)} 条")
-        else:
-            print("[警告] 优选 IP 全部不可达,回退直连地址")
-    else:
-        print("[4/4] 未拿到优选 IP,使用节点直连地址")
+            links = [to_uri(c, c.get("server_name", "Zoog")) for c in pooled]
+            fast = min([v for v in lat_map.values() if v is not None], default=None)
 
-    write_sub(links, OUT_DIR / "zoog.txt")
-    write_sub(links[:TOP_N], OUT_DIR / "zoog-top30.txt")
-    write_sub(direct_links, OUT_DIR / "zoog-direct.txt")
-    (OUT_DIR / "vless_links.txt").write_text("\n".join(links), encoding="utf-8")
+        write_sub(links, OUT_DIR / f"{prefix}.txt")
+        write_sub(links[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
+        if isp == "默认":
+            default_links = links
+        print(f"      [{isp:4}] {len(links)} 条 -> {prefix}.txt (+top30)  最快 {fast}ms")
 
-    print(f"完成! {OUT_DIR / 'zoog.txt'} ({len(links)} 条, 优选CF)")
-    print(f"      {OUT_DIR / 'zoog-top30.txt'} ({min(TOP_N, len(links))} 条)")
-    print(f"      {OUT_DIR / 'zoog-direct.txt'} ({len(direct_links)} 条, 直连兜底)")
+    (OUT_DIR / "vless_links.txt").write_text("\n".join(default_links), encoding="utf-8")
+    print("完成!")
 
 
 if __name__ == "__main__":
