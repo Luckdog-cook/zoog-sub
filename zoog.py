@@ -12,15 +12,19 @@ zoog.py — 抓取 ZoogVPN 节点并生成订阅文件
      现在直接用节点真实地址生成订阅。
   4. 输出目录支持 ZOOG_OUTPUT 环境变量(默认 ./output)。
 
-输出文件(output/ 下):
-  zoog.txt        base64 订阅, 全部节点
-  zoog-top30.txt  base64 订阅, 延迟最低的 30 个
+输出文件(output/ 下, 每个运营商一套, 前缀 zoog/t-zoog/u-zoog/m-zoog):
+  {p}.txt        base64 订阅, 精简 + 全量(节点名带 [精简]/[全量] 标签)
+  {p}-lite.txt   只精简: 每个真实出口 x 5 个优选 IP
+  {p}-full.txt   只全量: 每个节点 x 5 个优选 IP
+  {p}-top30.txt  前 30 条(精简优先)
+  zoog-direct.txt 不套 CF 优选的直连兜底
   vless_links.txt 明文 vless:// 链接, 便于核对
 """
 
 import base64
 import os
 import random
+import re
 import socket
 import sys
 import time
@@ -55,6 +59,20 @@ CF_TOP_K = 5
 
 # 运营商 -> 输出文件名前缀
 ISP_FILES = {"默认": "zoog", "电信": "t-zoog", "联通": "u-zoog", "移动": "m-zoog"}
+
+# 订阅内分类标签(写进节点名,客户端可按关键字过滤)
+TAG_LITE = "[精简]"
+TAG_FULL = "[全量]"
+TAG_DIRECT = "[直连]"
+
+# 真实出口主机前缀 -> 国家(精简列表用,取代 123 个虚名)
+EXIT_CN = {
+    "nl": "荷兰", "sg": "新加坡", "us": "美国", "fr": "法国", "es": "西班牙",
+    "de": "德国", "jp": "日本", "gb": "英国", "uk": "英国", "ca": "加拿大",
+    "au": "澳洲", "kr": "韩国", "in": "印度", "br": "巴西", "tr": "土耳其",
+    "se": "瑞典", "ch": "瑞士", "it": "意大利", "ru": "俄罗斯", "pl": "波兰",
+    "hk": "香港", "tw": "台湾", "vn": "越南", "th": "泰国", "id": "印尼",
+}
 
 _sess = requests.Session()
 _sess.verify = False
@@ -211,6 +229,15 @@ def to_uri(c, label):
     return f"vless://{c['id']}@{c['address']}:{c['port']}?{'&'.join(p)}#{name}"
 
 
+def exit_label(host: str) -> str:
+    """把真实出口主机名翻译成 国家-主机, 用于精简列表命名。"""
+    h = (host or "").lower()
+    m = re.match(r"^([a-z]{2})\d*[-.]", h)
+    cn = EXIT_CN.get(m.group(1)) if m else None
+    # 出口主机大多在 Cloudflare 后面, IP 归属查不到真实落地, 只能靠 Zoog 自己的命名前缀
+    return f"{cn}-{host}" if cn else f"其他-{host}"
+
+
 def tcp_probe(host, port, timeout=3.0):
     t = time.perf_counter()
     try:
@@ -344,8 +371,19 @@ def main():
     alive.sort(key=lambda x: (x["latency"] is None, x["latency"] or 0))
     print(f"      存活: {len(alive)} 个")
 
+    # 精简集合: 每个真实出口(主机+端口+传输)只保留延迟最低的那一个
+    # 131 个节点其实只落在少数几个出口上, 国家名基本是同一批中继的别名
+    lite_map = {}
+    for n in alive:  # alive 已按延迟升序
+        k = (n["address"], n["port"], n["network"])
+        if k not in lite_map:
+            lite_map[k] = n
+    lite_nodes = list(lite_map.values())
+    print(f"      精简(按真实出口去重): {len(lite_nodes)} 个")
+
     # 直连版本(兜底,不套优选)
-    direct_links = [to_uri(n, n.get("server_name", "Zoog")) for n in alive]
+    direct_links = [to_uri(n, f"{TAG_DIRECT} {n.get('server_name', 'Zoog')}")
+                    for n in alive]
     write_sub(direct_links, OUT_DIR / "zoog-direct.txt")
     print(f"      直连兜底: {len(direct_links)} 条")
 
@@ -355,6 +393,8 @@ def main():
         for prefix in ISP_FILES.values():
             write_sub(direct_links, OUT_DIR / f"{prefix}.txt")
             write_sub(direct_links[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
+            write_sub(direct_links, OUT_DIR / f"{prefix}-lite.txt")
+            write_sub(direct_links, OUT_DIR / f"{prefix}-full.txt")
         (OUT_DIR / "vless_links.txt").write_text("\n".join(direct_links), encoding="utf-8")
         print("完成!")
         return
@@ -384,33 +424,63 @@ def main():
 
         if not any(best_by_port.values()):
             print(f"      [{isp}] 优选 IP 全部不可达,回退直连")
-            links = direct_links
+            lite_links = [to_uri(n, f"{TAG_LITE} {exit_label(n.get('serverName') or n['address'])}")
+                          for n in lite_nodes]
+            full_links = direct_links
             fast = None
         else:
-            # 全组合: 每个节点 x 该运营商的每个优选 IP
-            pooled = []
-            for n in alive:
-                pool_ips = best_by_port.get(n["port"])
-                if not pool_ips:
-                    continue
-                for ip in pool_ips:
-                    c = dict(n)
-                    if not c.get("serverName"):
-                        c["serverName"] = c["address"]  # 保留原主机名做 SNI
-                    c["address"] = ip
-                    c["latency"] = lat_map.get((ip, n["port"]))
-                    c["cf_ip"] = ip
-                    pooled.append(c)
-            # 节点名带上优选 IP,便于客户端区分
-            links = [to_uri(c, f'{c.get("server_name", "Zoog")}-{c["cf_ip"]}')
-                     for c in pooled]
+            # 全组合: 每个节点 x 该运营商的每个优选 IP(换地址, 保留原主机名做 SNI)
+            def cross(nodes):
+                out = []
+                for n in nodes:
+                    pool_ips = best_by_port.get(n["port"])
+                    if not pool_ips:
+                        continue
+                    for ip in pool_ips:
+                        c = dict(n)
+                        if not c.get("serverName"):
+                            c["serverName"] = c["address"]
+                        host = c["serverName"]
+                        c["address"] = ip
+                        c["latency"] = lat_map.get((ip, n["port"]))
+                        c["cf_ip"] = ip
+                        c["orig_host"] = host
+                        c["orig_addr"] = n["address"]
+                        out.append(c)
+                return out
+
+            full_cf = cross(alive)
+            lite_cf = cross(lite_nodes)
+
+            # 全量: 保留原始国家名; 精简: 用真实出口命名
+            full_links = [to_uri(c, f'{TAG_FULL} {c.get("server_name", "Zoog")}-{c["cf_ip"]}')
+                          for c in full_cf]
+            def lite_name(c):
+                h = c.get("orig_host") or ""
+                lb = exit_label(h)
+                if lb == h:  # SNI 是伪装域名(如 staging.gitlab.com), 回退真实地址
+                    lb = exit_label(c.get("orig_addr", ""))
+                return lb
+
+            lite_links = [to_uri(c, f"{TAG_LITE} {lite_name(c)}-{c['cf_ip']}")
+                          for c in lite_cf]
             fast = min([v for v in lat_map.values() if v is not None], default=None)
 
-        write_sub(links, OUT_DIR / f"{prefix}.txt")
-        write_sub(links[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
+        # 主订阅 = 精简 + 全量(都带标签,客户端可按 [精简]/[全量] 过滤)
+        merged = lite_links + full_links
+
+        write_sub(merged, OUT_DIR / f"{prefix}.txt")
+        write_sub(lite_links, OUT_DIR / f"{prefix}-lite.txt")
+        write_sub(full_links, OUT_DIR / f"{prefix}-full.txt")
+
+        # top30: 精简优先 + 全量里最快的,凑够 TOP_N
+        top = (lite_links + full_links)[:TOP_N]
+        write_sub(top, OUT_DIR / f"{prefix}-top30.txt")
+
         if isp == "默认":
-            default_links = links
-        print(f"      [{isp:4}] {len(links)} 条 -> {prefix}.txt (+top30)  最快 {fast}ms")
+            default_links = merged
+        print(f"      [{isp:4}] 精简 {len(lite_links)} + 全量 {len(full_links)} "
+              f"= {len(merged)} 条 -> {prefix}.txt (+lite/full/top30)  最快 {fast}ms")
 
     (OUT_DIR / "vless_links.txt").write_text("\n".join(default_links), encoding="utf-8")
     print("完成!")
