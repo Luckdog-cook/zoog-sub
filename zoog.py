@@ -387,19 +387,23 @@ def main():
             links = direct_links
             fast = None
         else:
+            # 全组合: 每个节点 x 该运营商的每个优选 IP
             pooled = []
-            for idx, n in enumerate(alive):
+            for n in alive:
                 pool_ips = best_by_port.get(n["port"])
                 if not pool_ips:
                     continue
-                ip = pool_ips[idx % len(pool_ips)]
-                c = dict(n)
-                if not c.get("serverName"):
-                    c["serverName"] = c["address"]  # 保留原主机名做 SNI
-                c["address"] = ip
-                c["latency"] = lat_map.get((ip, n["port"]))
-                pooled.append(c)
-            links = [to_uri(c, c.get("server_name", "Zoog")) for c in pooled]
+                for ip in pool_ips:
+                    c = dict(n)
+                    if not c.get("serverName"):
+                        c["serverName"] = c["address"]  # 保留原主机名做 SNI
+                    c["address"] = ip
+                    c["latency"] = lat_map.get((ip, n["port"]))
+                    c["cf_ip"] = ip
+                    pooled.append(c)
+            # 节点名带上优选 IP,便于客户端区分
+            links = [to_uri(c, f'{c.get("server_name", "Zoog")}-{c["cf_ip"]}')
+                     for c in pooled]
             fast = min([v for v in lat_map.values() if v is not None], default=None)
 
         write_sub(links, OUT_DIR / f"{prefix}.txt")
