@@ -45,6 +45,10 @@ AES_IV = "CufmfUjCLT8MiY0z"
 PROTOCOLS = ("SS_XR_SYSPR", "SS_XR_PR")
 TOP_N = 30
 
+# Cloudflare 优选 IP 源(旧路径 BestCF/mobile.txt 等已 404,现用改版后的文件)
+BESTCF_V4 = "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/bestcfv4.txt"
+CF_TOP_K = 5
+
 _sess = requests.Session()
 _sess.verify = False
 
@@ -214,6 +218,22 @@ def write_sub(links, path):
         base64.b64encode("\n".join(links).encode()).decode(), encoding="utf-8")
 
 
+def fetch_cf_ips():
+    """拉取 Cloudflare 优选 IP(直连,不走代理)"""
+    try:
+        r = requests.get(BESTCF_V4, timeout=20)
+        ips = []
+        for line in r.text.splitlines():
+            ip = line.strip().split(":")[0].split("#")[0].strip()
+            if ip and (ip.startswith("104.") or ip.startswith("172.") or ip.startswith("162.")):
+                if ip not in ips:
+                    ips.append(ip)
+        return ips
+    except Exception as e:
+        print(f"[警告] 优选 IP 拉取失败: {e}")
+        return []
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[诊断] 输出目录: {OUT_DIR}")
@@ -297,15 +317,58 @@ def main():
     alive.sort(key=lambda x: (x["latency"] is None, x["latency"] or 0))
     print(f"      存活: {len(alive)} 个")
 
-    links = [to_uri(n, n.get("server_name", "Zoog")) for n in alive]
-    print(f"[4/4] 生成订阅: {len(links)} 条")
+    # 直连版本(兜底,不套优选)
+    direct_links = [to_uri(n, n.get("server_name", "Zoog")) for n in alive]
+
+    # ---- 套用 Cloudflare 优选 IP(换地址、保留原 SNI) ----
+    links = direct_links
+    cf_ips = fetch_cf_ips()
+    if cf_ips:
+        print(f"[4/4] 优选 IP: 拿到 {len(cf_ips)} 个,开始测速...")
+        ports = sorted({n["port"] for n in alive})
+        lat_map = {}
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futs = {ex.submit(tcp_probe, ip, p): (ip, p) for ip in cf_ips for p in ports}
+            for f in as_completed(futs):
+                lat_map[futs[f]] = f.result()
+
+        best_by_port = {}
+        for p in ports:
+            ranked = sorted([(l, ip) for (ip, pp), l in lat_map.items()
+                             if pp == p and l is not None])
+            best_by_port[p] = [ip for l, ip in ranked[:CF_TOP_K]]
+            if ranked:
+                print(f"      端口 {p}: 最快 {ranked[0][1]} ({ranked[0][0]}ms), 取前 {len(best_by_port[p])} 个")
+
+        if any(best_by_port.values()):
+            pooled = []
+            for idx, n in enumerate(alive):
+                pool_ips = best_by_port.get(n["port"])
+                if not pool_ips:
+                    continue
+                ip = pool_ips[idx % len(pool_ips)]
+                c = dict(n)
+                if not c.get("serverName"):
+                    c["serverName"] = c["address"]  # 保留原主机名做 SNI
+                c["address"] = ip
+                c["latency"] = lat_map.get((ip, n["port"]))
+                pooled.append(c)
+            if pooled:
+                links = [to_uri(c, c.get("server_name", "Zoog")) for c in pooled]
+                print(f"      优选套用完成: {len(links)} 条")
+        else:
+            print("[警告] 优选 IP 全部不可达,回退直连地址")
+    else:
+        print("[4/4] 未拿到优选 IP,使用节点直连地址")
 
     write_sub(links, OUT_DIR / "zoog.txt")
     write_sub(links[:TOP_N], OUT_DIR / "zoog-top30.txt")
+    write_sub(direct_links, OUT_DIR / "zoog-direct.txt")
     (OUT_DIR / "vless_links.txt").write_text("\n".join(links), encoding="utf-8")
 
-    print(f"完成! {OUT_DIR / 'zoog.txt'} ({len(links)} 条)")
+    print(f"完成! {OUT_DIR / 'zoog.txt'} ({len(links)} 条, 优选CF)")
     print(f"      {OUT_DIR / 'zoog-top30.txt'} ({min(TOP_N, len(links))} 条)")
+    print(f"      {OUT_DIR / 'zoog-direct.txt'} ({len(direct_links)} 条, 直连兜底)")
 
 
 if __name__ == "__main__":
