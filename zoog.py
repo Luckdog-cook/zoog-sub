@@ -61,9 +61,10 @@ CF_TOP_K = 5
 ISP_FILES = {"默认": "zoog", "电信": "t-zoog", "联通": "u-zoog", "移动": "m-zoog"}
 
 # 订阅内分类标签(写进节点名,客户端可按关键字过滤)
-TAG_LITE = "[精简]"
-TAG_FULL = "[全量]"
-TAG_DIRECT = "[直连]"
+TAG_LITE = "[精简]"      # 按真实出口去重 x 每个优选 IP
+TAG_RR = "[轮流]"        # 每个节点轮流分配 1 个优选 IP
+TAG_CROSS = "[全交叉]"   # 每个节点 x 每个优选 IP(全组合)
+TAG_DIRECT = "[直连]"    # 不套 CF 优选
 
 # 真实出口主机前缀 -> 国家(精简列表用,取代 123 个虚名)
 EXIT_CN = {
@@ -394,6 +395,7 @@ def main():
             write_sub(direct_links, OUT_DIR / f"{prefix}.txt")
             write_sub(direct_links[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
             write_sub(direct_links, OUT_DIR / f"{prefix}-lite.txt")
+            write_sub(direct_links, OUT_DIR / f"{prefix}-rr.txt")
             write_sub(direct_links, OUT_DIR / f"{prefix}-full.txt")
         (OUT_DIR / "vless_links.txt").write_text("\n".join(direct_links), encoding="utf-8")
         print("完成!")
@@ -422,21 +424,31 @@ def main():
                              if pp == p and l is not None])
             best_by_port[p] = [ip for l, ip in ranked[:CF_TOP_K]]
 
+        def lite_name(c):
+            h = c.get("orig_host") or ""
+            lb = exit_label(h)
+            if lb == h:  # SNI 是伪装域名(如 staging.gitlab.com), 回退真实地址
+                lb = exit_label(c.get("orig_addr", ""))
+            return lb
+
         if not any(best_by_port.values()):
             print(f"      [{isp}] 优选 IP 全部不可达,回退直连")
             lite_links = [to_uri(n, f"{TAG_LITE} {exit_label(n.get('serverName') or n['address'])}")
                           for n in lite_nodes]
-            full_links = direct_links
+            rr_links = cross_links = full_links = direct_links
             fast = None
         else:
-            # 全组合: 每个节点 x 该运营商的每个优选 IP(换地址, 保留原主机名做 SNI)
-            def cross(nodes):
+            # 换 address 为优选 IP, 保留原主机名做 SNI
+            #   mode="all" 全组合交叉: 每个节点 x 每个优选 IP
+            #   mode="rr"  轮流交换:   每个节点轮流拿 1 个优选 IP
+            def cross(nodes, mode="all"):
                 out = []
-                for n in nodes:
+                for idx, n in enumerate(nodes):
                     pool_ips = best_by_port.get(n["port"])
                     if not pool_ips:
                         continue
-                    for ip in pool_ips:
+                    ips = pool_ips if mode == "all" else [pool_ips[idx % len(pool_ips)]]
+                    for ip in ips:
                         c = dict(n)
                         if not c.get("serverName"):
                             c["serverName"] = c["address"]
@@ -449,38 +461,36 @@ def main():
                         out.append(c)
                 return out
 
-            full_cf = cross(alive)
-            lite_cf = cross(lite_nodes)
+            def build(cf, tag, name_of):
+                return [to_uri(c, f"{tag} {name_of(c)}-{c['cf_ip']}") for c in cf]
 
-            # 全量: 保留原始国家名; 精简: 用真实出口命名
-            full_links = [to_uri(c, f'{TAG_FULL} {c.get("server_name", "Zoog")}-{c["cf_ip"]}')
-                          for c in full_cf]
-            def lite_name(c):
-                h = c.get("orig_host") or ""
-                lb = exit_label(h)
-                if lb == h:  # SNI 是伪装域名(如 staging.gitlab.com), 回退真实地址
-                    lb = exit_label(c.get("orig_addr", ""))
-                return lb
+            lite_cf = cross(lite_nodes, "all")
+            rr_cf = cross(alive, "rr")
+            full_cf = cross(alive, "all")
 
-            lite_links = [to_uri(c, f"{TAG_LITE} {lite_name(c)}-{c['cf_ip']}")
-                          for c in lite_cf]
+            lite_links = build(lite_cf, TAG_LITE, lite_name)
+            rr_links = build(rr_cf, TAG_RR,
+                             lambda c: c.get("server_name", "Zoog"))
+            full_links = build(full_cf, TAG_CROSS,
+                               lambda c: c.get("server_name", "Zoog"))
             fast = min([v for v in lat_map.values() if v is not None], default=None)
 
-        # 主订阅 = 精简 + 全量(都带标签,客户端可按 [精简]/[全量] 过滤)
-        merged = lite_links + full_links
+        # 主订阅 = 精简 + 轮流 + 全交叉(都带标签,客户端可按标签过滤/分组)
+        merged = lite_links + rr_links + full_links
 
         write_sub(merged, OUT_DIR / f"{prefix}.txt")
         write_sub(lite_links, OUT_DIR / f"{prefix}-lite.txt")
+        write_sub(rr_links, OUT_DIR / f"{prefix}-rr.txt")
         write_sub(full_links, OUT_DIR / f"{prefix}-full.txt")
 
-        # top30: 精简优先 + 全量里最快的,凑够 TOP_N
-        top = (lite_links + full_links)[:TOP_N]
-        write_sub(top, OUT_DIR / f"{prefix}-top30.txt")
+        # top30: 精简优先, 再轮流, 再全交叉
+        write_sub(merged[:TOP_N], OUT_DIR / f"{prefix}-top30.txt")
 
         if isp == "默认":
             default_links = merged
-        print(f"      [{isp:4}] 精简 {len(lite_links)} + 全量 {len(full_links)} "
-              f"= {len(merged)} 条 -> {prefix}.txt (+lite/full/top30)  最快 {fast}ms")
+        print(f"      [{isp:4}] 精简 {len(lite_links)} + 轮流 {len(rr_links)} "
+              f"+ 全交叉 {len(full_links)} = {len(merged)} 条 -> {prefix}.txt "
+              f"(+lite/rr/full/top30)  最快 {fast}ms")
 
     (OUT_DIR / "vless_links.txt").write_text("\n".join(default_links), encoding="utf-8")
     print("完成!")
